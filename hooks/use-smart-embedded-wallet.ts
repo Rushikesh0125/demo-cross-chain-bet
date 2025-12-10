@@ -1,7 +1,7 @@
 import { Address, Authorization, createWalletClient, custom } from "viem";
 import { useSign7702Authorization } from "@privy-io/react-auth";
 import { AuthorizationRequest, WalletClientSigner } from "@aa-sdk/core";
-import { sepolia, alchemy } from "@account-kit/infra";
+import { baseSepolia, alchemy } from "@account-kit/infra";
 import { useEffect, useState } from "react";
 import {
   createSmartWalletClient,
@@ -29,7 +29,7 @@ export const useSmartEmbeddedWallet = ({
       const baseSigner = new WalletClientSigner(
         createWalletClient({
           account: embeddedWallet.address as Address,
-          chain: sepolia,
+          chain: baseSepolia,
           transport: custom(provider),
         }),
         "privy"
@@ -54,7 +54,7 @@ export const useSmartEmbeddedWallet = ({
       };
 
       const client = createSmartWalletClient({
-        chain: sepolia,
+        chain: baseSepolia,
         transport: alchemy({
           apiKey,
         }),

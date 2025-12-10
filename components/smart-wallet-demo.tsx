@@ -1,13 +1,32 @@
 import { ConnectedWallet as PrivyWallet } from "@privy-io/react-auth";
 import { useSmartEmbeddedWallet } from "../hooks/use-smart-embedded-wallet";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { Address, Hex } from "viem";
-import { encodeFunctionData, parseEther } from "viem";
+import { encodeFunctionData, parseEther, createWalletClient, custom, createPublicClient, http } from "viem";
+import { CrossChainBetting } from "./CrossChainBetting";
+import { useToast } from "./ToastProvider";
+import { polygonAmoy as polygonAmoyAk, alchemy } from "@account-kit/infra";
+import {
+  createSmartWalletClient,
+  SmartWalletClient,
+} from "@account-kit/wallet-client";
+import { WalletClientSigner } from "@aa-sdk/core";
+import { useSign7702Authorization } from "@privy-io/react-auth";
+import type { AuthorizationRequest, Authorization } from "@aa-sdk/core";
 
 // Contract addresses from environment variables
-const DEMO_TOKEN_ADDRESS = process.env.NEXT_PUBLIC_DEMO_TOKEN_ADDRESS as Address;
-const EXTERNAL_CONTRACT_ADDRESS = process.env.NEXT_PUBLIC_EXTERNAL_CONTRACT_ADDRESS as Address;
-const PROXY_CONTRACT_ADDRESS = process.env.NEXT_PUBLIC_PROXY_CONTRACT_ADDRESS as Address;
+const DEMO_TOKEN_ADDRESS =
+  (process.env.NEXT_PUBLIC_DEMO_TOKEN_ADDRESS ||
+    process.env.NEXT_PUBLIC_DEMO_TOKEN_ADDRESS_POLYGON ||
+    process.env.NEXT_PUBLIC_DEMO_TOKEN_ADDRESS_BASE) as Address | undefined;
+const EXTERNAL_CONTRACT_ADDRESS =
+  (process.env.NEXT_PUBLIC_EXTERNAL_CONTRACT_ADDRESS ||
+    process.env.NEXT_PUBLIC_EXTERNAL_CONTRACT_ADDRESS_POLYGON ||
+    process.env.NEXT_PUBLIC_EXTERNAL_CONTRACT_ADDRESS_BASE) as Address | undefined;
+const PROXY_CONTRACT_ADDRESS =
+  (process.env.NEXT_PUBLIC_PROXY_CONTRACT_ADDRESS ||
+    process.env.NEXT_PUBLIC_PROXY_CONTRACT_ADDRESS_POLYGON ||
+    process.env.NEXT_PUBLIC_PROXY_CONTRACT_ADDRESS_BASE) as Address | undefined;
 
 // ABI for ERC20 approve function
 const ERC20_ABI = [
@@ -20,6 +39,15 @@ const ERC20_ABI = [
       { name: 'amount', type: 'uint256' }
     ],
     outputs: [{ name: '', type: 'bool' }]
+  },
+  {
+    name: 'balanceOf',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'owner', type: 'address' }
+    ],
+    outputs: [{ name: 'balance', type: 'uint256' }]
   }
 ] as const;
 
@@ -61,6 +89,8 @@ export const SmartWalletDemo = ({
   embeddedWallet: PrivyWallet;
 }) => {
   const { client } = useSmartEmbeddedWallet({ embeddedWallet });
+  const toast = useToast();
+  const { signAuthorization } = useSign7702Authorization();
 
   const [status, setStatus] = useState<
     | { status: "idle" | "error" | "sending" }
@@ -122,6 +152,11 @@ export const SmartWalletDemo = ({
       return;
     }
 
+    if (!DEMO_TOKEN_ADDRESS || !EXTERNAL_CONTRACT_ADDRESS || !PROXY_CONTRACT_ADDRESS) {
+      toast.error("Contract addresses are not configured. Check your .env.local.");
+      return;
+    }
+
     setStatus({ status: "sending" });
     try {
       const amount = parseEther(betAmount);
@@ -150,11 +185,11 @@ export const SmartWalletDemo = ({
         from: embeddedWallet.address as Address,
         calls: [
           {
-            to: DEMO_TOKEN_ADDRESS,
+            to: DEMO_TOKEN_ADDRESS as Address,
             data: approveCallData,
           },
           {
-            to: PROXY_CONTRACT_ADDRESS,
+            to: PROXY_CONTRACT_ADDRESS as Address,
             data: betForCallData,
           },
         ],
@@ -181,55 +216,150 @@ export const SmartWalletDemo = ({
 
   // New: Withdraw & Bridge batched transaction
   const executeWithdrawAndBridge = useCallback(async () => {
-    if (!client || !withdrawAddress || !bridgeAmount) {
+    if (!withdrawAddress || !bridgeAmount) {
       alert("Please fill in all fields");
+      return;
+    }
+
+    const apiKey = process.env.NEXT_PUBLIC_ALCHEMY_API_KEY || "";
+    if (!apiKey) {
+      toast.error("Missing NEXT_PUBLIC_ALCHEMY_API_KEY");
+      return;
+    }
+
+    const POLY_TOKEN = process.env.NEXT_PUBLIC_DEMO_TOKEN_ADDRESS_POLYGON as Address | undefined;
+    const POLY_PROXY = process.env.NEXT_PUBLIC_PROXY_CONTRACT_ADDRESS_POLYGON as Address | undefined;
+    if (!POLY_TOKEN || !POLY_PROXY) {
+      toast.error("Polygon addresses not configured. Set *_POLYGON env vars.");
       return;
     }
 
     setStatus({ status: "sending" });
     try {
+      // Ensure provider present and attempt to switch for clarity (not required for gasless)
+      const provider = await (embeddedWallet as any)?.getEthereumProvider?.();
+      try {
+        await provider?.request?.({
+          method: "wallet_switchEthereumChain",
+          params: [{ chainId: "0x13882" }], // Polygon Amoy
+        });
+      } catch {}
+
+      // Build Polygon Amoy smart wallet client
+      const baseSigner = new WalletClientSigner(
+        createWalletClient({
+          account: embeddedWallet.address as Address,
+          chain: polygonAmoyAk,
+          transport: custom(provider),
+        }),
+        "privy"
+      );
+      const signer = {
+        ...baseSigner,
+        signAuthorization: async (
+          unsignedAuth: AuthorizationRequest<number>
+        ): Promise<Authorization<number, true>> => {
+          const signature = await signAuthorization({
+            ...unsignedAuth,
+            contractAddress: unsignedAuth.address ?? unsignedAuth.contractAddress,
+          });
+          return {
+            ...unsignedAuth,
+            ...signature,
+          };
+        },
+      } as any;
+      const polygonClient: SmartWalletClient = createSmartWalletClient({
+        chain: polygonAmoyAk,
+        transport: alchemy({ apiKey }),
+        signer,
+        policyId: process.env.NEXT_PUBLIC_ALCHEMY_POLICY_ID,
+      });
+
       const amount = parseEther(bridgeAmount);
 
-      // Encode the withdrawPayout call data
+      // 1) withdrawPayout(to)
       const withdrawCallData = encodeFunctionData({
         abi: PROXY_ABI,
         functionName: 'withdrawPayout',
-        args: [withdrawAddress as Address]
+        args: [withdrawAddress as Address],
       });
 
-      // Encode the approve call data (approve Proxy to spend tokens)
+      // 2) approve(PROXY, amount)
       const approveCallData = encodeFunctionData({
         abi: ERC20_ABI,
         functionName: 'approve',
-        args: [PROXY_CONTRACT_ADDRESS, amount]
+        args: [POLY_PROXY as Address, amount],
       });
 
-      // Encode the depositeForBridge call data
+      // 3) depositeForBridge(amount)
       const bridgeCallData = encodeFunctionData({
         abi: PROXY_ABI,
         functionName: 'depositeForBridge',
-        args: [amount]
+        args: [amount],
       });
+
+      // Preflight: simulate withdraw and check token balance (if withdraw not possible)
+      let skipWithdraw = false;
+      try {
+        const publicClient = createPublicClient({
+          chain: polygonAmoyAk,
+          transport: http(`https://polygon-amoy.g.alchemy.com/v2/${apiKey}`),
+        });
+        // Try a static call of withdraw to detect immediate reverts
+        await publicClient.call({
+          to: POLY_PROXY as Address,
+          data: withdrawCallData,
+          account: embeddedWallet.address as Address,
+        });
+      } catch {
+        skipWithdraw = true;
+      }
+      if (skipWithdraw) {
+        try {
+          const publicClient = createPublicClient({
+            chain: polygonAmoyAk,
+            transport: http(`https://polygon-amoy.g.alchemy.com/v2/${apiKey}`),
+          });
+          const balance = (await publicClient.readContract({
+            address: POLY_TOKEN as Address,
+            abi: ERC20_ABI as any,
+            functionName: 'balanceOf',
+            args: [embeddedWallet.address as Address],
+          })) as bigint;
+          if (balance < amount) {
+            toast.error("No payout available and insufficient token balance to bridge this amount.");
+            setStatus({ status: "idle" });
+            return;
+          }
+        } catch {
+          // Continue; the batch may still provide an error if something is wrong
+        }
+      }
 
       // Send batched calls with EIP-7702
       const {
         preparedCallIds: [callId],
-      } = await client.sendCalls({
+      } = await polygonClient.sendCalls({
         capabilities: {
           eip7702Auth: true,
         },
         from: embeddedWallet.address as Address,
         calls: [
+          ...(skipWithdraw
+            ? []
+            : [
+                {
+                  to: POLY_PROXY as Address,
+                  data: withdrawCallData,
+                },
+              ]),
           {
-            to: PROXY_CONTRACT_ADDRESS,
-            data: withdrawCallData,
-          },
-          {
-            to: DEMO_TOKEN_ADDRESS,
+            to: POLY_TOKEN as Address,
             data: approveCallData,
           },
           {
-            to: PROXY_CONTRACT_ADDRESS,
+            to: POLY_PROXY as Address,
             data: bridgeCallData,
           },
         ],
@@ -239,7 +369,7 @@ export const SmartWalletDemo = ({
         throw new Error("Missing call id");
       }
 
-      const { receipts } = await client.waitForCallsStatus({ id: callId });
+      const { receipts } = await polygonClient.waitForCallsStatus({ id: callId });
       if (!receipts?.length) {
         throw new Error("Missing transaction receipts");
       }
@@ -261,6 +391,16 @@ export const SmartWalletDemo = ({
   const handleSetCurrentUserWithdraw = () => {
     setWithdrawAddress(embeddedWallet.address);
   };
+
+  useEffect(() => {
+    if (status.status === "success") {
+      toast.success("Transaction confirmed!");
+    } else if (status.status === "error") {
+      toast.error("Transaction failed. Please try again.");
+    }
+    // Only react to status changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status.status]);
 
   return (
     <div className="flex flex-col gap-6">
@@ -432,6 +572,14 @@ export const SmartWalletDemo = ({
               : "Withdraw & Bridge (Sponsored & Batched)"}
           </button>
         </div>
+      </div>
+
+      {/* Cross-Chain Betting Section */}
+      <div className="border-b pb-6">
+        <h3 className="text-md font-semibold text-gray-800 mb-3">
+          4. Cross-Chain Betting (Base → Polygon)
+        </h3>
+        <CrossChainBetting embeddedWallet={embeddedWallet} />
       </div>
 
       {/* Contract Addresses Info */}

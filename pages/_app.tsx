@@ -2,7 +2,8 @@ import "../styles/globals.css";
 import type { AppProps } from "next/app";
 import Head from "next/head";
 import { PrivyProvider } from "@privy-io/react-auth";
-import { sepolia } from "viem/chains";
+import { baseSepolia, polygonAmoy } from "viem/chains";
+import { ToastProvider } from "../components/ToastProvider";
 
 function MyApp({ Component, pageProps }: AppProps) {
   return (
@@ -48,11 +49,13 @@ function MyApp({ Component, pageProps }: AppProps) {
             showWalletUIs: false,
             createOnLogin: "all-users",
           },
-          defaultChain: sepolia,
-          supportedChains: [sepolia],
+          defaultChain: baseSepolia,
+          supportedChains: [baseSepolia, polygonAmoy],
         }}
       >
-        <Component {...pageProps} />
+        <ToastProvider>
+          <Component {...pageProps} />
+        </ToastProvider>
       </PrivyProvider>
     </>
   );
